@@ -16,6 +16,7 @@ import torch.nn as nn
 import torchaudio
 from tqdm import tqdm
 import librosa
+from torch.cuda.amp import GradScaler, autocast # For AMP
 
 try:
     from .encoders import InstrumentTimbreEncoder, ChineseInstrumentTimbreEncoder
@@ -43,6 +44,238 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+class SourceSeparator:
+    """
+    Handles audio source separation using Demucs.
+    """
+    def __init__(self, device):
+        self.device = device
+        self._demucs_model = None
+        self._apply_demucs = None
+
+    def _load_demucs_model(self):
+        """
+        Lazy load the Demucs model for source separation.
+        """
+        if self._demucs_model is None:
+            try:
+                # Import here to keep Demucs as an optional dependency for the class
+                import torch 
+                from demucs.pretrained import get_model
+                from demucs.apply import apply_model
+
+                logger.info("Loading Demucs model for source separation...")
+                self._demucs_model = get_model("htdemucs")
+                self._demucs_model.to(self.device)
+                logger.info("Demucs model loaded")
+
+                # Save reference to apply function
+                self._apply_demucs = apply_model
+            except ImportError as e:
+                logger.error(f"Could not import demucs: {e}")
+                logger.error("Please install demucs with: pip install demucs")
+                return False
+            except Exception as e:
+                logger.error(f"Error loading Demucs model: {e}")
+                return False
+        return True
+
+    def separate_audio_sources(self, audio_file, output_dir=None):
+        """
+        Separate audio into different instrument sources using Demucs.
+
+        Args:
+            audio_file: Path to input audio file.
+            output_dir: Directory to save separated tracks.
+
+        Returns:
+            Dictionary with paths to separated sources, or None on failure.
+        """
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(audio_file), "separated")
+        os.makedirs(output_dir, exist_ok=True)
+
+        if not self._load_demucs_model():
+            return None
+
+        try:
+            import torch # Already imported for _load_demucs_model, but good for clarity
+            import torchaudio # Assuming torchaudio is available for audio loading
+
+            logger.info(f"Loading audio file: {audio_file}")
+            audio, sr = torchaudio.load(audio_file)
+
+            if audio.shape[0] > 2: # More than stereo
+                logger.warning(f"Audio has {audio.shape[0]} channels, using first two only.")
+                audio = audio[:2]
+            elif audio.shape[0] == 1: # Mono
+                audio = audio.repeat(2, 1) # Duplicate mono to stereo for Demucs
+
+            if sr != 44100: # Demucs expects 44.1 kHz
+                logger.info(f"Resampling from {sr} to 44100 Hz")
+                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=44100).to(self.device)
+                audio = resampler(audio.to(self.device)) # Move to device before resampling if not already
+            else:
+                audio = audio.to(self.device)
+            
+            logger.info("Separating audio sources...")
+            sources = self._apply_demucs(self._demucs_model, audio)
+            source_names = self._demucs_model.sources
+
+            output_files = {}
+            for i, name in enumerate(source_names):
+                source_audio = sources[i]
+                source_filename = f"{os.path.splitext(os.path.basename(audio_file))[0]}_{name}.wav"
+                source_path = os.path.join(output_dir, source_filename)
+                
+                torchaudio.save(source_path, source_audio.cpu(), 44100) # Save at 44.1kHz
+                output_files[name] = source_path
+                logger.info(f"Saved {name} track to {source_path}")
+
+            return {"sources": output_files, "source_names": source_names}
+
+        except Exception as e:
+            logger.error(f"Error separating audio sources: {e}", exc_info=True)
+            return None
+
+
+class ModelPersistenceManager:
+    """
+    Handles loading and saving of model checkpoints for InstrumentTimbreModel.
+    """
+    def __init__(self, encoder, decoder, device):
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+    def _load_partial_weights_in_manager(self, checkpoint):
+        """Load partial weights in compatibility mode, adapted for manager context."""
+        # Attempt to load partial weights using manual parameter mapping
+        if "encoder" in checkpoint:
+            encoder_state = checkpoint["encoder"]
+
+            # Manually load shared layers
+            own_state = self.encoder.state_dict()
+            for name, param in encoder_state.items():
+                if name in own_state and own_state[name].shape == param.shape:
+                    own_state[name].copy_(param)
+                    logger.info(f"Loaded parameter: {name}")
+
+            # Special handling for attention mechanism layers
+            if (
+                "attention.gamma" in encoder_state
+                and "self_attention.gamma" in own_state
+            ):
+                own_state["self_attention.gamma"].copy_(
+                    encoder_state["attention.gamma"]
+                )
+                logger.info("Mapped attention.gamma -> self_attention.gamma")
+
+            if (
+                "attention.query.weight" in encoder_state
+                and "self_attention.query.weight" in own_state
+            ):
+                own_state["self_attention.query.weight"].copy_(
+                    encoder_state["attention.query.weight"]
+                )
+                own_state["self_attention.query.bias"].copy_(
+                    encoder_state["attention.query.bias"]
+                )
+                own_state["self_attention.key.weight"].copy_(
+                    encoder_state["attention.key.weight"]
+                )
+                own_state["self_attention.key.bias"].copy_(
+                    encoder_state["attention.key.bias"]
+                )
+                own_state["self_attention.value.weight"].copy_(
+                    encoder_state["attention.value.weight"]
+                )
+                own_state["self_attention.value.bias"].copy_(
+                    encoder_state["attention.value.bias"]
+                )
+                logger.info("Mapped attention mechanism parameters")
+
+        # Load decoder weights
+        if "decoder" in checkpoint:
+            decoder_state = checkpoint["decoder"]
+            own_state = self.decoder.state_dict()
+            for name, param in decoder_state.items():
+                if name in own_state and own_state[name].shape == param.shape:
+                    own_state[name].copy_(param)
+                    logger.info(f"Loaded decoder parameter: {name}")
+
+        logger.info("Partial model weights loaded in compatibility mode")
+
+    def load_model(self, model_path):
+        """
+        Load a saved model from model_path.
+
+        Args:
+            model_path: Path to the saved model.
+
+        Returns:
+            A dictionary with loading status and information:
+            {
+                'success': bool,
+                'config': dict (loaded model config, empty if not found),
+                'compat_mode': bool (True if compatibility mode was used)
+            }
+        """
+        compat_mode_used = False
+        loaded_config = {}
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
+            try:
+                # Attempt to load normally
+                self.encoder.load_state_dict(checkpoint["encoder"])
+                self.decoder.load_state_dict(checkpoint["decoder"])
+                logger.info(f"Model loaded from {model_path}")
+            except Exception as e:
+                # If normal loading fails, enable compatibility mode
+                logger.error(f"Error loading model from {model_path}: {e}")
+                logger.info("Enabling compatibility mode for older model format")
+                compat_mode_used = True
+                # Attempt to load partial weights
+                self._load_partial_weights_in_manager(checkpoint)
+
+            # Load configuration if exists
+            if "config" in checkpoint:
+                loaded_config = checkpoint["config"]
+                logger.info(f"Loaded model configuration: {loaded_config}")
+            
+            return {'success': True, 'config': loaded_config, 'compat_mode': compat_mode_used}
+
+        except Exception as e:
+            logger.error(f"Failed to load model from {model_path}: {e}")
+            return {'success': False, 'config': {}, 'compat_mode': False}
+
+    def save_model(self, save_path, current_config_dict):
+        """
+        Save the model.
+
+        Args:
+            save_path: Path to save the model.
+            current_config_dict: Dictionary containing current configuration to save (e.g., chinese_instruments).
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+
+        try:
+            # Save encoder and decoder state dictionaries
+            checkpoint = {
+                "encoder": self.encoder.state_dict(),
+                "decoder": self.decoder.state_dict(),
+                "config": current_config_dict,
+            }
+
+            torch.save(checkpoint, save_path)
+            logger.info(f"Model saved to {save_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving model to {save_path}: {e}")
+            return False
 
 
 # Custom Chroma transform implementation since torchaudio.transforms.Chroma is not available
@@ -337,16 +570,32 @@ class InstrumentTimbreModel:
         self.encoder.to(self.device)
         self.decoder.to(self.device)
 
-        # Load saved model if provided
-        if model_path is not None:
-            self.load_model(model_path)
+        # Initialize ModelPersistenceManager
+        self.persistence_manager = ModelPersistenceManager(self.encoder, self.decoder, self.device)
 
-        # Initialize Demucs model for source separation (lazy loading)
-        self._demucs_model = None
+        # Initialize SourceSeparator
+        self.source_separator = SourceSeparator(self.device)
 
-        # Compatibility layer to solve dimension mismatch issues
+        # Compatibility layer to solve dimension mismatch issues - initialized by loading logic
         self.compat_mode = False
         self.dimension_adapter = None
+
+        # Load saved model if provided
+        if model_path is not None:
+            load_status = self.persistence_manager.load_model(model_path)
+            if load_status['success']:
+                loaded_config = load_status.get('config', {})
+                self.chinese_instruments = loaded_config.get('chinese_instruments', self.chinese_instruments)
+                self.compat_mode = load_status.get('compat_mode', False)
+                if self.compat_mode:
+                    # Create a dimension adapter - for handling conversions between 3D and 4D tensors
+                    self.dimension_adapter = DimensionAdapter().to(self.device)
+                    logger.info("DimensionAdapter created due to compat_mode.") 
+            else:
+                logger.error(f"Model loading failed for path: {model_path}. Initializing with default configuration.")
+
+        # Note: self._demucs_model is no longer part of InstrumentTimbreModel directly.
+        # It's managed within self.source_separator.
 
         # Initialize encoder dictionary
         self.encoders = {
@@ -389,147 +638,12 @@ class InstrumentTimbreModel:
                 self.chinese_instruments = config.get(
                     "chinese_instruments", self.chinese_instruments
                 )
-                logger.info(f"Loaded model configuration: {config}")
-
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load model from {model_path}: {e}")
-            return False
-
-    def save_model(self, save_path):
-        """
-        Save the model
-
-        Args:
-            save_path: Path to save the model
-        """
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-
-        try:
-            # Save encoder and decoder state dictionaries
-            checkpoint = {
-                "encoder": self.encoder.state_dict(),
-                "decoder": self.decoder.state_dict(),
-                "config": {
-                    "chinese_instruments": self.chinese_instruments,
-                    "timestamp": torch.backends.cudnn.version()
-                    if torch.backends.cudnn.is_available()
-                    else None,
-                },
-            }
-
-            torch.save(checkpoint, save_path)
-            logger.info(f"Model saved to {save_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving model to {save_path}: {e}")
-            return False
-
-    def _load_demucs_model(self):
-        """
-        Lazy load the Demucs model for source separation
-        """
-        if self._demucs_model is None:
-            try:
-                import torch
-                from demucs.pretrained import get_model
-                from demucs.apply import apply_model
-
-                logger.info("Loading Demucs model for source separation...")
-                self._demucs_model = get_model("htdemucs")
-                self._demucs_model.to(self.device)
-                logger.info("Demucs model loaded")
-
-                # Save reference to apply function
-                self._apply_demucs = apply_model
-            except ImportError as e:
-                logger.error(f"Could not import demucs: {e}")
-                logger.error("Please install demucs with: pip install demucs")
-                return False
-            except Exception as e:
-                logger.error(f"Error loading Demucs model: {e}")
-                return False
-
-        return True
-
     def separate_audio_sources(self, audio_file, output_dir=None):
         """
-        Separate audio into different instrument sources using Demucs
-
-        Args:
-            audio_file: Path to input audio file
-            output_dir: Directory to save separated tracks
-
-        Returns:
-            Dictionary with paths to separated sources
+        Separate audio into different instrument sources using Demucs.
+        This method is now a wrapper around SourceSeparator.separate_audio_sources.
         """
-        # Use input file's directory if output_dir not specified
-        if output_dir is None:
-            output_dir = os.path.join(os.path.dirname(audio_file), "separated")
-
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Load Demucs model if needed
-        if not self._load_demucs_model():
-            return None
-
-        try:
-            # Import here to avoid dependency if not used
-            import torch
-            import torchaudio
-
-            # Load audio
-            logger.info(f"Loading audio file: {audio_file}")
-            audio, sr = torchaudio.load(audio_file)
-
-            # Convert to mono if needed for processing
-            if audio.shape[0] > 2:
-                logger.warning(
-                    f"Audio has {audio.shape[0]} channels, using first two only"
-                )
-                audio = audio[:2]
-            elif audio.shape[0] == 1:
-                # Duplicate mono to stereo
-                audio = audio.repeat(2, 1)
-
-            # Ensure correct sample rate for Demucs
-            if sr != 44100:
-                logger.info(f"Resampling from {sr} to 44100 Hz")
-                resampler = torchaudio.transforms.Resample(sr, 44100)
-                audio = resampler(audio)
-                sr = 44100
-
-            # Move to device
-            audio = audio.to(self.device)
-
-            # Separate sources
-            logger.info("Separating audio sources...")
-            sources = self._apply_demucs(self._demucs_model, audio)
-
-            # Get source names
-            source_names = self._demucs_model.sources
-
-            # Save each source
-            output_files = {}
-            for i, name in enumerate(source_names):
-                source_audio = sources[i]
-                source_path = os.path.join(
-                    output_dir,
-                    f"{os.path.splitext(os.path.basename(audio_file))[0]}_{name}.wav",
-                )
-
-                # Save audio source
-                torchaudio.save(source_path, source_audio.cpu(), sr)
-                output_files[name] = source_path
-                logger.info(f"Saved {name} track to {source_path}")
-
-            return {"sources": output_files, "source_names": source_names}
-
-        except Exception as e:
-            logger.error(f"Error separating audio sources: {e}")
-            return None
+        return self.source_separator.separate_audio_sources(audio_file, output_dir)
 
     def extract_timbre(
         self,
@@ -923,6 +1037,15 @@ class InstrumentTimbreModel:
         self.writer = SummaryWriter(f"logs/timbre_model_{int(time.time())}")
         logger.info(f"TensorBoard logging enabled at {self.writer.log_dir}")
 
+        # AMP setup
+        use_amp = torch.cuda.is_available()
+        if use_amp:
+            scaler = GradScaler()
+            logger.info("AMP enabled for training as CUDA is available.")
+        else:
+            logger.info("AMP not enabled for training (CUDA not available or use_amp=False).")
+
+
         for epoch in range(epochs):
             total_loss = 0
             total_batches = 0
@@ -949,35 +1072,43 @@ class InstrumentTimbreModel:
                 else:
                     # If constant values, just zero out to avoid NaN
                     mel_spec = torch.zeros_like(mel_spec)
-
-                # Forward pass through encoder and decoder
-                # The mel_spec shape should be [batch_size, 1, height, width]
-                # Make sure mel_spec has the right shape before passing to encoder
-                if mel_spec.dim() != 4:
-                    raise ValueError(
-                        f"Expected 4D tensor [batch_size, channels, height, width], got shape: {mel_spec.shape}"
-                    )
-
-                # Ensure mel_spec has the correct channel dimension
-                if mel_spec.shape[1] != 1:
-                    print(
-                        f"WARNING: Expected 1 channel, got {mel_spec.shape[1]}. Reshaping..."
-                    )
-                    # Take only the first item from each batch and reshape
-                    mel_spec = mel_spec[:, 0:1, :, :]
-                    print(f"New shape: {mel_spec.shape}")
-
-                timbre_vector = self.encoder(mel_spec)
-                reconstructed = self.decoder(timbre_vector)
-
-                # Compute loss
-                loss = criterion(reconstructed, mel_spec)
-
-                # Backward pass and optimize
+                
                 optimizer.zero_grad()
-                loss.backward()
 
-                # Add aggressive gradient clipping to prevent gradient explosion
+                with autocast(enabled=use_amp):
+                    # Forward pass through encoder and decoder
+                    # The mel_spec shape should be [batch_size, 1, height, width]
+                    # Make sure mel_spec has the right shape before passing to encoder
+                    if mel_spec.dim() != 4:
+                        raise ValueError(
+                            f"Expected 4D tensor [batch_size, channels, height, width], got shape: {mel_spec.shape}"
+                        )
+
+                    # Ensure mel_spec has the correct channel dimension
+                    if mel_spec.shape[1] != 1:
+                        print(
+                            f"WARNING: Expected 1 channel, got {mel_spec.shape[1]}. Reshaping..."
+                        )
+                        # Take only the first item from each batch and reshape
+                        mel_spec = mel_spec[:, 0:1, :, :]
+                        print(f"New shape: {mel_spec.shape}")
+
+                    timbre_vector = self.encoder(mel_spec)
+                    reconstructed = self.decoder(timbre_vector)
+
+                    # Compute loss
+                    loss = criterion(reconstructed, mel_spec)
+
+                # Backward pass
+                if use_amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                # Gradient Clipping (after unscaling if using AMP)
+                if use_amp:
+                    scaler.unscale_(optimizer) # Unscale gradients before clipping
+                
                 torch.nn.utils.clip_grad_norm_(
                     list(self.encoder.parameters()) + list(self.decoder.parameters()),
                     max_norm=0.5,  # Lower max_norm for more stability
@@ -992,9 +1123,14 @@ class InstrumentTimbreModel:
                         skip_step = True
                         logger.warning("NaN detected in gradients, skipping step")
                         break
-
+                
+                # Optimizer step
                 if not skip_step:
-                    optimizer.step()
+                    if use_amp:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
 
                 # Log statistics
                 total_loss += loss.item()
@@ -1031,67 +1167,21 @@ class InstrumentTimbreModel:
 
             # Update learning rate scheduler
             scheduler.step(avg_loss)
+        
+        # Save model after training - using the persistence manager
+        # Assuming args.model_path is available in this scope or passed appropriately
+        # For now, let's assume self.last_model_save_path is set during train command in app.py
+        # Or, train() should accept save_path as an argument.
+        # For this refactor, I'll assume that the calling context (e.g. app.py)
+        # will call persistence_manager.save_model after train() completes.
+        # If train itself must save, it needs the path and config.
+        # The original code called self.save_model(args.model_path) from app.py after model.train(...)
+        # This means InstrumentTimbreModel.train() does not need to save the model itself.
+        # However, the original InstrumentTimbreModel.train() had a writer.close()
+        # which implies it considered itself the end of the training process.
 
         # Close TensorBoard writer
         self.writer.close()
-
-    def _load_partial_weights(self, checkpoint):
-        """Load partial weights in compatibility mode"""
-        # Attempt to load partial weights using manual parameter mapping
-        if "encoder" in checkpoint:
-            encoder_state = checkpoint["encoder"]
-
-            # Manually load shared layers
-            own_state = self.encoder.state_dict()
-            for name, param in encoder_state.items():
-                if name in own_state and own_state[name].shape == param.shape:
-                    own_state[name].copy_(param)
-                    logger.info(f"Loaded parameter: {name}")
-
-            # Special handling for attention mechanism layers
-            if (
-                "attention.gamma" in encoder_state
-                and "self_attention.gamma" in own_state
-            ):
-                own_state["self_attention.gamma"].copy_(
-                    encoder_state["attention.gamma"]
-                )
-                logger.info("Mapped attention.gamma -> self_attention.gamma")
-
-            if (
-                "attention.query.weight" in encoder_state
-                and "self_attention.query.weight" in own_state
-            ):
-                own_state["self_attention.query.weight"].copy_(
-                    encoder_state["attention.query.weight"]
-                )
-                own_state["self_attention.query.bias"].copy_(
-                    encoder_state["attention.query.bias"]
-                )
-                own_state["self_attention.key.weight"].copy_(
-                    encoder_state["attention.key.weight"]
-                )
-                own_state["self_attention.key.bias"].copy_(
-                    encoder_state["attention.key.bias"]
-                )
-                own_state["self_attention.value.weight"].copy_(
-                    encoder_state["attention.value.weight"]
-                )
-                own_state["self_attention.value.bias"].copy_(
-                    encoder_state["attention.value.bias"]
-                )
-                logger.info("Mapped attention mechanism parameters")
-
-        # Load decoder weights
-        if "decoder" in checkpoint:
-            decoder_state = checkpoint["decoder"]
-            own_state = self.decoder.state_dict()
-            for name, param in decoder_state.items():
-                if name in own_state and own_state[name].shape == param.shape:
-                    own_state[name].copy_(param)
-                    logger.info(f"Loaded decoder parameter: {name}")
-
-        logger.info("Partial model weights loaded in compatibility mode")
 
 
 # Add a dimension adapter class to handle conversions between 3D and 4D tensors

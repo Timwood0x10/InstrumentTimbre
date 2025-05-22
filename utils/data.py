@@ -143,7 +143,7 @@ def collate_fn(batch):
 def prepare_dataloader(
     dataset_path,
     batch_size=32,
-    num_workers=4,
+    num_workers=None, # Changed default to None for dynamic assignment
     use_wav_files=False,
     augment=False,
     debug=False,
@@ -152,6 +152,7 @@ def prepare_dataloader(
     # Add path verification
     import os
     import logging
+    import torch # Ensure torch is imported for cuda check
 
     logger = logging.getLogger(__name__)
 
@@ -185,11 +186,20 @@ def prepare_dataloader(
 
     logger.info(f"Dataset size: {len(dataset)} samples")
 
+    if num_workers is None:
+        num_workers = os.cpu_count() // 2 if os.cpu_count() else 4
+        num_workers = max(1, num_workers) # Ensure at least 1 worker
+    
+    pin_memory_setting = True if torch.cuda.is_available() else False
+    logger.info(f"Using num_workers={num_workers} and pin_memory={pin_memory_setting} for DataLoader.")
+
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
+        pin_memory=pin_memory_setting,
         collate_fn=collate_fn,  # Use custom collate function to handle variable-length sequences
     )
 
@@ -199,7 +209,7 @@ def prepare_dataloader(
 def prepare_chinese_instrument_dataloader(
     dataset_path,
     batch_size=32,
-    num_workers=4,
+    num_workers=None, # Changed default to None for dynamic assignment
     use_wav_files=False,
     augment=True,
     debug=False,
@@ -215,11 +225,21 @@ def prepare_chinese_instrument_dataloader(
         fixed_length=256,  # Use fixed length to ensure consistent tensor sizes
     )
 
+    if num_workers is None:
+        num_workers = os.cpu_count() // 2 if os.cpu_count() else 4
+        num_workers = max(1, num_workers) # Ensure at least 1 worker
+
+    pin_memory_setting = True if torch.cuda.is_available() else False
+    # Assuming logger is defined if this function is called (it is at module level, but good practice if this were standalone)
+    # logger.info(f"Using num_workers={num_workers} and pin_memory={pin_memory_setting} for Chinese Instrument DataLoader.")
+
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
+        pin_memory=pin_memory_setting,
         collate_fn=collate_fn,  # Use custom collate function to handle variable-length sequences
     )
 
