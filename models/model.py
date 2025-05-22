@@ -79,6 +79,191 @@ class ChromaTransform:
         return torch.from_numpy(chroma).float()
 
 
+class AudioFeatureProcessor:
+    """
+    Handles audio feature extraction processes like Mel spectrogram, Chroma, and MFCC.
+    """
+
+    def __init__(self, feature_cache=None, sample_rate=44100, n_fft=2048, hop_length=512, n_mels=128, n_chroma=12, n_mfcc=20, device=None):
+        self.feature_cache = feature_cache
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.n_chroma = n_chroma
+        self.n_mfcc = n_mfcc
+        self.device = device if device else torch.device("cpu") # Default to CPU if no device specified
+
+        # Mel spectrogram converter
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.sample_rate, n_fft=self.n_fft, hop_length=self.hop_length, n_mels=self.n_mels
+        ).to(self.device)
+
+        # Chroma converter - using custom implementation
+        self.chroma_transform = ChromaTransform(
+            sample_rate=self.sample_rate, n_fft=self.n_fft, hop_length=self.hop_length, n_chroma=self.n_chroma
+        ) # ChromaTransform itself handles numpy conversion, so device placement is for input tensor
+
+        # MFCC converter
+        self.mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=self.sample_rate,
+            n_mfcc=self.n_mfcc,
+            melkwargs={"n_fft": self.n_fft, "hop_length": self.hop_length, "n_mels": self.n_mels},
+        ).to(self.device)
+
+    def to_mel_spectrogram(self, audio, sample_rate=None):
+        """
+        Convert audio to Mel spectrogram
+
+        Args:
+            audio: Audio data Tensor [channels, samples]
+            sample_rate: Sample rate of the input audio. If None, assumes self.sample_rate.
+
+        Returns:
+            Mel spectrogram Tensor [n_mels, time]
+        """
+        current_sample_rate = sample_rate if sample_rate is not None else self.sample_rate
+        # Ensure correct sample rate
+        if current_sample_rate != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=current_sample_rate, new_freq=self.sample_rate
+            ).to(audio.device)
+            audio = resampler(audio)
+
+        # Extract Mel spectrogram
+        mel_spec = self.mel_transform(audio.to(self.device))
+
+        # Convert to log scale
+        mel_spec = torch.log(mel_spec + 1e-9)
+
+        return mel_spec
+
+    def to_chroma(self, audio, sample_rate=None):
+        """
+        Convert audio to chroma features
+
+        Args:
+            audio: Audio data Tensor [channels, samples] or path to audio file for caching.
+            sample_rate: Sample rate of the input audio. If None, assumes self.sample_rate.
+
+        Returns:
+            Chroma features Tensor [n_chroma, time]
+        """
+        current_sample_rate = sample_rate if sample_rate is not None else self.sample_rate
+        # Check cache first if available and audio is a file path
+        if (
+            self.feature_cache # Check if feature_cache is enabled
+            and isinstance(audio, str)
+            and os.path.exists(audio)
+        ):
+            cached_chroma = self.feature_cache.get_chroma(audio)
+            if cached_chroma is not None:
+                return cached_chroma.to(self.device)
+
+
+        # Ensure audio is a tensor for processing
+        if isinstance(audio, str): # If it was a path but not in cache, load it
+            loaded_audio, loaded_sr = load_audio(audio, sr=current_sample_rate, mono=True) # Assuming load_audio is available
+            if loaded_audio is None:
+                # Fallback for safety, though ideally load_audio would raise an error or be checked by caller
+                return torch.zeros((self.n_chroma, 128), device=self.device) # Default fallback size
+            audio_tensor = loaded_audio
+            current_sample_rate = loaded_sr
+        else:
+            audio_tensor = audio
+
+
+        # Ensure correct sample rate
+        if current_sample_rate != self.sample_rate and isinstance(audio_tensor, torch.Tensor):
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=current_sample_rate, new_freq=self.sample_rate
+            ).to(audio_tensor.device)
+            audio_tensor = resampler(audio_tensor)
+
+        # Extract chroma features
+        try:
+            # ChromaTransform expects CPU tensor or numpy array
+            chroma = self.chroma_transform(audio_tensor.cpu()) 
+            chroma = chroma.to(self.device)
+
+
+            # Handle NaN values
+            if isinstance(chroma, torch.Tensor) and torch.isnan(chroma).any():
+                mel_shape_fallback_dim = 128 # Default fallback time dimension
+                if isinstance(audio_tensor, torch.Tensor):
+                    try:
+                        # Attempt to get a more reasonable shape based on potential mel_spec
+                        # This is a bit indirect; ideally, the time dimension should be calculated from input audio length
+                        mel_spec_temp = self.mel_transform(audio_tensor.to(self.device))
+                        mel_shape_fallback_dim = mel_spec_temp.shape[-1]
+                    except Exception:
+                        pass # Use default if mel_transform fails
+                chroma = torch.zeros((self.n_chroma, mel_shape_fallback_dim), device=self.device)
+
+
+            # Cache the result if it was a file path
+            if (
+                self.feature_cache # Check if feature_cache is enabled
+                and isinstance(audio, str) # Check original audio type
+                and os.path.exists(audio)
+                and isinstance(chroma, torch.Tensor)
+            ):
+                self.feature_cache.put_chroma(audio, chroma.cpu()) # Cache CPU tensor
+
+            return chroma
+
+        except Exception as e:
+            logger.error(f"Chroma extraction failed: {e}")
+            mel_shape_fallback_dim = 128 # Default fallback time dimension
+            if isinstance(audio_tensor, torch.Tensor):
+                try:
+                    mel_spec_temp = self.mel_transform(audio_tensor.to(self.device))
+                    mel_shape_fallback_dim = mel_spec_temp.shape[-1]
+                except Exception:
+                    pass
+            return torch.zeros((self.n_chroma, mel_shape_fallback_dim), device=self.device)
+
+    def to_mfcc(self, audio, sample_rate=None):
+        """
+        Convert audio to MFCC features
+
+        Args:
+            audio: Audio data Tensor [channels, samples]
+            sample_rate: Sample rate of the input audio. If None, assumes self.sample_rate.
+
+        Returns:
+            MFCC features Tensor [n_mfcc, time]
+        """
+        current_sample_rate = sample_rate if sample_rate is not None else self.sample_rate
+        # Ensure correct sample rate
+        if current_sample_rate != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=current_sample_rate, new_freq=self.sample_rate
+            ).to(audio.device)
+            audio = resampler(audio)
+
+        # Extract MFCC
+        try:
+            mfcc = self.mfcc_transform(audio.to(self.device))
+
+            # Handle NaN values
+            if torch.isnan(mfcc).any():
+                # Fallback: use the shape from mel_transform as a guess for time dimension
+                time_dim = self.mel_transform(audio.to(self.device)).shape[-1]
+                mfcc = torch.zeros((self.n_mfcc, time_dim), device=self.device)
+        except Exception as e:
+            logger.error(f"MFCC extraction failed: {e}")
+            # Fallback: use the shape from mel_transform as a guess for time dimension
+            time_dim = 128 # Default fallback
+            try:
+                time_dim = self.mel_transform(audio.to(self.device)).shape[-1]
+            except Exception:
+                pass
+            mfcc = torch.zeros((self.n_mfcc, time_dim), device=self.device)
+
+        return mfcc
+
+
 class InstrumentTimbreModel:
     """
     Main class for instrument timbre analysis and manipulation
@@ -122,9 +307,13 @@ class InstrumentTimbreModel:
 
         # Initialize feature cache if enabled
         self.feature_caching = feature_caching
+        self.feature_cache = None # Initialize to None
         if feature_caching:
             self.feature_cache = FeatureCache(cache_dir)
             logger.info(f"Feature cache initialized at {self.feature_cache.cache_dir}")
+
+        # Initialize AudioFeatureProcessor
+        self.feature_processor = AudioFeatureProcessor(feature_cache=self.feature_cache, device=self.device)
 
         # Initialize encoder based on configuration
         if chinese_instruments:
@@ -148,9 +337,6 @@ class InstrumentTimbreModel:
         self.encoder.to(self.device)
         self.decoder.to(self.device)
 
-        # Initialize audio feature extractors
-        self._init_audio_transforms()
-
         # Load saved model if provided
         if model_path is not None:
             self.load_model(model_path)
@@ -170,152 +356,6 @@ class InstrumentTimbreModel:
             else ChineseInstrumentTimbreEncoder().to(self.device),
         }
 
-    def _init_audio_transforms(self):
-        """Initialize audio feature extraction transforms"""
-        # Mel spectrogram converter
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=44100, n_fft=2048, hop_length=512, n_mels=128
-        )
-
-        # Chroma converter - using custom implementation
-        self.chroma_transform = ChromaTransform(
-            sample_rate=44100, n_fft=2048, hop_length=512, n_chroma=12
-        )
-
-        # MFCC converter
-        self.mfcc_transform = torchaudio.transforms.MFCC(
-            sample_rate=44100,
-            n_mfcc=20,
-            melkwargs={"n_fft": 2048, "hop_length": 512, "n_mels": 128},
-        )
-
-    def to_mel_spectrogram(self, audio, sample_rate=44100):
-        """
-        Convert audio to Mel spectrogram
-
-        Args:
-            audio: Audio data Tensor [channels, samples]
-            sample_rate: Sample rate
-
-        Returns:
-            Mel spectrogram Tensor [n_mels, time]
-        """
-        # Ensure correct sample rate
-        if sample_rate != 44100:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate, new_freq=44100
-            )
-            audio = resampler(audio)
-
-        # Extract Mel spectrogram
-        mel_spec = self.mel_transform(audio)
-
-        # Convert to log scale
-        mel_spec = torch.log(mel_spec + 1e-9)
-
-        return mel_spec
-
-    def to_chroma(self, audio, sample_rate=44100):
-        """
-        Convert audio to chroma features
-
-        Args:
-            audio: Audio data Tensor [channels, samples]
-            sample_rate: Sample rate
-
-        Returns:
-            Chroma features Tensor [n_chroma, time]
-        """
-        # Check cache first if available
-        if (
-            FeatureCache is not None
-            and isinstance(audio, str)
-            and os.path.exists(audio)
-        ):
-            # Audio is a file path, try to get from cache
-            cache = FeatureCache()
-            cached_chroma = cache.get_chroma(audio)
-            if cached_chroma is not None:
-                return cached_chroma
-
-        # Ensure correct sample rate
-        if sample_rate != 44100 and isinstance(audio, torch.Tensor):
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate, new_freq=44100
-            )
-            audio = resampler(audio)
-
-        # Extract chroma features
-        try:
-            chroma = self.chroma_transform(audio)
-
-            # Handle NaN values
-            if isinstance(chroma, torch.Tensor) and torch.isnan(chroma).any():
-                if isinstance(audio, torch.Tensor):
-                    mel_shape = self.mel_transform(audio).shape[1]
-                    chroma = torch.zeros((12, mel_shape), device=audio.device)
-                else:
-                    chroma = torch.zeros((12, 128))  # Default fallback size
-
-            # Cache the result if it's a file path
-            if (
-                FeatureCache is not None
-                and isinstance(audio, str)
-                and os.path.exists(audio)
-            ):
-                cache = FeatureCache()
-                cache.put_chroma(audio, chroma)
-
-            return chroma
-
-        except Exception as e:
-            # If chroma extraction fails, return zero tensor
-            print(f"Chroma extraction failed: {e}")
-            if isinstance(audio, torch.Tensor):
-                try:
-                    mel_shape = self.mel_transform(audio).shape[1]
-                    return torch.zeros((12, mel_shape), device=audio.device)
-                except:
-                    return torch.zeros((12, 128), device=self.device)
-            else:
-                return torch.zeros((12, 128))
-
-    def to_mfcc(self, audio, sample_rate=44100):
-        """
-        Convert audio to MFCC features
-
-        Args:
-            audio: Audio data Tensor [channels, samples]
-            sample_rate: Sample rate
-
-        Returns:
-            MFCC features Tensor [n_mfcc, time]
-        """
-        # Ensure correct sample rate
-        if sample_rate != 44100:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate, new_freq=44100
-            )
-            audio = resampler(audio)
-
-        # Extract MFCC
-        try:
-            mfcc = self.mfcc_transform(audio)
-
-            # Handle NaN values
-            if torch.isnan(mfcc).any():
-                mfcc = torch.zeros(
-                    (20, self.mel_transform(audio).shape[1]), device=audio.device
-                )
-        except Exception as e:
-            # If MFCC extraction fails, return zero tensor
-            print(f"MFCC extraction failed: {e}")
-            mfcc = torch.zeros(
-                (20, self.mel_transform(audio).shape[1]), device=audio.device
-            )
-
-        return mfcc
-
     def load_model(self, model_path):
         """
         Load a saved model
@@ -327,20 +367,20 @@ class InstrumentTimbreModel:
             checkpoint = torch.load(model_path, map_location=self.device)
 
             try:
-                # 尝试正常加载
+                # Attempt to load normally
                 self.encoder.load_state_dict(checkpoint["encoder"])
                 self.decoder.load_state_dict(checkpoint["decoder"])
                 logger.info(f"Model loaded from {model_path}")
             except Exception as e:
-                # 如果正常加载失败，启用兼容模式
+                # If normal loading fails, enable compatibility mode
                 logger.error(f"Error loading model from {model_path}: {e}")
                 logger.info("Enabling compatibility mode for older model format")
                 self.compat_mode = True
 
-                # 创建维度适配器 - 用于处理3D和4D张量之间的转换
+                # Create a dimension adapter - for handling conversions between 3D and 4D tensors
                 self.dimension_adapter = DimensionAdapter().to(self.device)
 
-                # 尝试加载部分权重
+                # Attempt to load partial weights
                 self._load_partial_weights(checkpoint)
 
             # Load configuration if exists
@@ -517,7 +557,7 @@ class InstrumentTimbreModel:
             Numpy array of timbre features
         """
         try:
-            # 支持直接传入音频数据
+            # Support direct input of audio data
             if isinstance(audio_path, torch.Tensor) or isinstance(
                 audio_path, np.ndarray
             ):
@@ -526,26 +566,26 @@ class InstrumentTimbreModel:
                 else:
                     audio_data = audio_path
 
-                # 如果是单声道，添加通道维度
+                # If mono, add channel dimension
                 if audio_data.dim() == 1:
                     audio_data = audio_data.unsqueeze(0)
 
-                # 获取采样率 - 使用默认值
+                # Get sample rate - use default value
                 sample_rate = 44100
             else:
-                # 从文件加载音频
+                # Load audio from file
                 audio_data, sample_rate = torchaudio.load(audio_path)
 
-                # 如果是立体声，转换为单声道
+                # If stereo, convert to mono
                 if audio_data.size(0) > 1:
                     audio_data = torch.mean(audio_data, dim=0, keepdim=True)
 
-            # 划分音频段
+            # Divide audio into segments
             segment_length = int(segment_duration * sample_rate)
             hop_size = int(hop_length * sample_rate)
             segments = []
 
-            # 如果音频太短，补零
+            # If audio is too short, pad with zeros
             if audio_data.size(1) < segment_length:
                 padded = torch.zeros(
                     (audio_data.size(0), segment_length), device=audio_data.device
@@ -553,24 +593,27 @@ class InstrumentTimbreModel:
                 padded[:, : audio_data.size(1)] = audio_data
                 segments.append(padded)
             else:
-                # 将音频分割成重叠的段
+                # Split audio into overlapping segments
                 for start in range(
                     0, audio_data.size(1) - segment_length + 1, hop_size
                 ):
                     segments.append(audio_data[:, start : start + segment_length])
 
-            # 为每个段提取特征
+            # Extract features for each segment
             all_features = []
             for segment in segments:
-                # 使用mel谱、色度图和MFCC作为输入特征
-                mel_spec = self.to_mel_spectrogram(segment, sample_rate)
-                chroma = self.to_chroma(segment, sample_rate)
-                mfcc = self.to_mfcc(segment, sample_rate)
+                # Use Mel spectrum, chroma features, and MFCC as input features
+                # Ensure segment is on the correct device for feature_processor methods
+                segment_device = segment.device if isinstance(segment, torch.Tensor) else self.device
+                
+                mel_spec = self.feature_processor.to_mel_spectrogram(segment.to(self.device), sample_rate)
+                chroma = self.feature_processor.to_chroma(segment.to(self.device), sample_rate) # to_chroma handles device internally for output
+                mfcc = self.feature_processor.to_mfcc(segment.to(self.device), sample_rate)
 
-                # 将所有特征拼接在一起 [C, F, T]
+                # Concatenate all features together [C, F, T]
                 combined_features = torch.cat([mel_spec, chroma, mfcc], dim=0)
 
-                # 检查特征维度
+                # Check feature dimensions
                 if (
                     torch.isnan(combined_features).any()
                     or torch.isinf(combined_features).any()
@@ -578,24 +621,26 @@ class InstrumentTimbreModel:
                     print(
                         f"Warning: NaN or Inf values in features. Using fallback method."
                     )
-                    # 使用简单特征作为备选
+                    # Use simple features as a fallback
+                    # Ensure segment is on the correct device for these direct transforms too
+                    segment_on_device = segment.to(self.device)
                     mel_spec = torchaudio.transforms.MelSpectrogram(
                         sample_rate=sample_rate, n_fft=2048, hop_length=512, n_mels=128
-                    )(segment)
+                    )(segment_on_device)
                     mel_spec = torch.log(mel_spec + 1e-9)
                     chroma = torch.zeros(
-                        (12, mel_spec.shape[1]), device=mel_spec.device
+                        (12, mel_spec.shape[-1]), device=self.device # Use self.device for consistency
                     )
-                    mfcc = torch.zeros((20, mel_spec.shape[1]), device=mel_spec.device)
+                    mfcc = torch.zeros((20, mel_spec.shape[-1]), device=self.device) # Use self.device
                     combined_features = torch.cat([mel_spec, chroma, mfcc], dim=0)
 
                 try:
-                    # 提取模型特征 - 直接将特征传递给编码器
+                    # Extract model features - pass features directly to the encoder
                     features = None
                     if instrument_type == "erhu" or "erhu" in str(audio_path).lower():
-                        # 使用中国传统乐器编码器
+                        # Use Chinese traditional instrument encoder
                         try:
-                            # 首先尝试使用专门的编码器
+                            # First, try using the specialized encoder
                             encoder = self.encoders.get(
                                 "chinese", self.encoders["default"]
                             )
@@ -604,46 +649,46 @@ class InstrumentTimbreModel:
                             print(
                                 f"Chinese encoder failed: {e}. Trying default encoder."
                             )
-                            # 如果失败，尝试使用默认编码器
+                            # If it fails, try using the default encoder
                             encoder = self.encoders["default"]
                             features = encoder(combined_features)
                     else:
-                        # 使用默认编码器
+                        # Use the default encoder
                         encoder = self.encoders.get(
                             instrument_type, self.encoders["default"]
                         )
                         features = encoder(combined_features)
 
-                    # 转换为numpy
+                    # Convert to numpy
                     if isinstance(features, torch.Tensor):
                         features = features.detach().cpu().numpy()
 
                     all_features.append(features)
 
                 except Exception as e:
-                    # 如果模型提取失败，使用备选方法
+                    # If model extraction fails, use a fallback method
                     print(
                         f"Error extracting features with model: {e}. Using fallback method."
                     )
 
-                    # 使用传统特征作为备选
-                    # 计算平均值和标准差等统计特征
+                    # Use traditional features as a fallback
+                    # Calculate statistical features like mean and standard deviation
                     mean_features = combined_features.mean(dim=-1).cpu().numpy()
                     std_features = combined_features.std(dim=-1).cpu().numpy()
                     max_features = combined_features.max(dim=-1)[0].cpu().numpy()
 
-                    # 合并统计特征
+                    # Combine statistical features
                     statistical_features = np.concatenate(
                         [mean_features, std_features, max_features]
                     )
 
-                    # 如果需要特定尺寸的特征，进行调整
-                    target_dim = 128  # 目标维度
+                    # Adjust if a specific feature dimension is required
+                    target_dim = 128  # Target dimension
                     if len(statistical_features) > target_dim:
-                        # 降维
+                        # Dimensionality reduction
                         statistical_features = statistical_features[:target_dim]
                     elif len(statistical_features) < target_dim:
-                        # 填充
+                        # Padding
                         pad_size = target_dim - len(statistical_features)
                         statistical_features = np.pad(
                             statistical_features, (0, pad_size), "constant"
@@ -651,14 +696,14 @@ class InstrumentTimbreModel:
 
                     all_features.append(statistical_features)
 
-            # 合并所有段的特征
+            # Combine features from all segments
             if return_all_segments:
                 features = np.array(all_features)
             else:
-                # 计算平均特征向量
+                # Calculate the mean feature vector
                 features = np.mean(all_features, axis=0)
 
-            # 归一化
+            # Normalization
             if normalize and features.size > 0:
                 features_mean = (
                     np.mean(features, axis=0)
@@ -668,56 +713,60 @@ class InstrumentTimbreModel:
                 features_std = (
                     np.std(features, axis=0) if features.ndim > 1 else np.std(features)
                 )
-                # 避免除以零
+                # Avoid division by zero
                 features_std = np.where(features_std < 1e-6, 1.0, features_std)
                 features = (features - features_mean) / features_std
 
             return features
 
         except Exception as e:
-            print(f"Error in extract_timbre: {e}")
-            print(f"Returning fallback feature vector")
-
-            # 返回一个合理的备选特征向量
-            fallback_dim = 128  # 默认特征维度
-            if return_all_segments:
-                # 创建一个假设的段数 (例如5段)
-                return np.random.randn(5, fallback_dim) * 0.1
-            else:
-                # 创建一个单一的特征向量
-                return np.random.randn(fallback_dim) * 0.1
+            logger.error(f"Error in extract_timbre: {e}", exc_info=True) # Log with stack trace
+            logger.info("All primary and statistical fallback feature extraction attempts failed within extract_timbre.")
+            # As per current design, _extract_fallback_features is not directly called as a fallback
+            # by the main extract_timbre method's internal loop.
+            # If it were, the logic would be here to call it.
+            # For now, returning None as the ultimate fallback.
+            return None
 
     def _extract_fallback_features(self, audio, sr, audio_file, output_dir):
         """Fallback feature extraction method, used when model extraction fails"""
         logger.info("Using fallback feature extraction method")
 
         try:
-            # 确定乐器类别
-            instrument_category = "弓弦类"  # 默认为弓弦类（二胡）
+            # Determine instrument category
+            instrument_category = "bowed_string"  # Default to bowed string (Erhu)
             file_lower = audio_file.lower()
-            if "erhu" in file_lower or "二胡" in file_lower:
-                instrument_category = "弓弦类"  # 弓弦类
-            elif "pipa" in file_lower or "琵琶" in file_lower:
-                instrument_category = "弹拨类"  # 弹拨类
-            elif "dizi" in file_lower or "笛子" in file_lower:
-                instrument_category = "吹管类"  # 吹管类
+            if "erhu" in file_lower or "二胡" in file_lower: # "二胡" means Erhu
+                instrument_category = "bowed_string"  # Bowed string
+            elif "pipa" in file_lower or "琵琶" in file_lower: # "琵琶" means Pipa
+                instrument_category = "plucked_string"  # Plucked string
+            elif "dizi" in file_lower or "笛子" in file_lower: # "笛子" means Dizi (flute)
+                instrument_category = "wind"  # Wind instrument
 
-            # 使用直接特征提取方法
+            # Use direct feature extraction method
+            # Ensure audio is a NumPy array for extract_chinese_instrument_features if it expects that
+            if isinstance(audio, torch.Tensor):
+                audio_np = audio.cpu().numpy()
+                if audio_np.ndim > 1 and audio_np.shape[0] == 1: # Mono tensor [1, N]
+                    audio_np = audio_np.squeeze(0)
+            else:
+                audio_np = audio # Assuming it's already a numpy array or compatible
+
             features = extract_chinese_instrument_features(
-                audio, sr, instrument_category=instrument_category
+                audio_np, sr, instrument_category=instrument_category
             )
 
-            # 将特征转换为嵌入向量
+            # Convert features to an embedding vector
             spectral_features = np.concatenate(
                 [
-                    features["spectral_centroid"].reshape(-1)[:32],  # 取前32个频谱质心特征
-                    features["spectral_contrast"].reshape(-1)[:32],  # 取前32个频谱对比度特征
-                    np.mean(features["harmonic_component"], axis=0)[:32],  # 取前32个谐波分量特征
-                    features["pitch_delta_stats"],  # 音高变化统计特征
+                    features["spectral_centroid"].reshape(-1)[:32],  # Take first 32 spectral centroid features
+                    features["spectral_contrast"].reshape(-1)[:32],  # Take first 32 spectral contrast features
+                    np.mean(features["harmonic_component"], axis=0)[:32],  # Take first 32 harmonic component features
+                    features["pitch_delta_stats"],  # Pitch variation statistics
                 ]
             )
 
-            # 填充或截断到128维
+            # Pad or truncate to 128 dimensions
             embedding_size = 128
             if len(spectral_features) < embedding_size:
                 embedding = np.pad(
@@ -726,10 +775,10 @@ class InstrumentTimbreModel:
             else:
                 embedding = spectral_features[:embedding_size]
 
-            # 创建结果
+            # Create result
             result = {"embedding": embedding, "features": features}
 
-            # 保存特征文件
+            # Save feature file
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
                 base_name = os.path.splitext(os.path.basename(audio_file))[0]
@@ -743,7 +792,7 @@ class InstrumentTimbreModel:
             return result
 
         except Exception as e:
-            logger.error(f"Fallback feature extraction failed: {e}")
+            logger.error(f"Fallback feature extraction failed: {e}", exc_info=True)
             return None
 
     def apply_timbre(
@@ -988,18 +1037,18 @@ class InstrumentTimbreModel:
 
     def _load_partial_weights(self, checkpoint):
         """Load partial weights in compatibility mode"""
-        # 使用手动参数映射尝试加载部分权重
+        # Attempt to load partial weights using manual parameter mapping
         if "encoder" in checkpoint:
             encoder_state = checkpoint["encoder"]
 
-            # 手动加载共享层
+            # Manually load shared layers
             own_state = self.encoder.state_dict()
             for name, param in encoder_state.items():
                 if name in own_state and own_state[name].shape == param.shape:
                     own_state[name].copy_(param)
                     logger.info(f"Loaded parameter: {name}")
 
-            # 处理注意力机制层的特殊情况
+            # Special handling for attention mechanism layers
             if (
                 "attention.gamma" in encoder_state
                 and "self_attention.gamma" in own_state
@@ -1033,7 +1082,7 @@ class InstrumentTimbreModel:
                 )
                 logger.info("Mapped attention mechanism parameters")
 
-        # 加载解码器权重
+        # Load decoder weights
         if "decoder" in checkpoint:
             decoder_state = checkpoint["decoder"]
             own_state = self.decoder.state_dict()
@@ -1045,7 +1094,7 @@ class InstrumentTimbreModel:
         logger.info("Partial model weights loaded in compatibility mode")
 
 
-# 添加一个维度适配器类来处理3D和4D张量之间的转换
+# Add a dimension adapter class to handle conversions between 3D and 4D tensors
 class DimensionAdapter(nn.Module):
     """Adapter class to handle dimension differences between old and new model formats"""
 

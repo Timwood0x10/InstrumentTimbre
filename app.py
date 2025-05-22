@@ -236,13 +236,34 @@ def main():
         )
 
         # Extract timbre features
-        result = model.extract_timbre(args.input_file, args.output_dir)
-        if result:
-            logger.info(
-                f"Timbre features extracted and saved to: {result['feature_file']}"
-            )
+        # The model.extract_timbre method returns features (numpy array) or None.
+        # It does not handle saving features itself.
+        instrument_type_arg = "chinese" if args.chinese_instruments else None
+        
+        logger.info(f"Extracting timbre features from: {args.input_file}")
+        features = model.extract_timbre(
+            audio_path=args.input_file,
+            instrument_type=instrument_type_arg
+        )
+
+        if features is not None:
+            logger.info(f"Successfully extracted timbre features from {args.input_file}.")
+            if args.output_dir:
+                try:
+                    os.makedirs(args.output_dir, exist_ok=True)
+                    base_name = os.path.splitext(os.path.basename(args.input_file))[0]
+                    output_feature_file = os.path.join(args.output_dir, f"{base_name}_timbre_features.npy")
+                    
+                    # Need numpy to save features
+                    import numpy as np
+                    np.save(output_feature_file, features)
+                    logger.info(f"Timbre features saved to: {output_feature_file}")
+                except Exception as e:
+                    logger.error(f"Failed to save timbre features to {args.output_dir}: {e}", exc_info=True)
+            else:
+                logger.info("--output-dir not specified, features were extracted but not saved.")
         else:
-            logger.error("Failed to extract timbre features")
+            logger.error(f"Failed to extract timbre features from {args.input_file} after all attempts. No features were saved.")
 
     elif args.command == "apply":
         # Load model
